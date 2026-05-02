@@ -116,4 +116,7 @@ void loop() {
     lastPrintTime = millis();
     printSystemStatus();
   }
+
+  // Thêm delay 1ms để giảm tải CPU (tránh nóng chip ESP32) và nhường thời gian cho FreeRTOS
+  delay(1);
 }
