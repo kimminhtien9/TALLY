@@ -163,6 +163,9 @@ void Network::init(const char *ip) {
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
+  
+  // Tăng công suất phát sóng lên tối đa (gần 20dBm) để truyền đi xa nhất có thể
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
 
   if (esp_now_init() == ESP_OK) {
     espnowReady = true;

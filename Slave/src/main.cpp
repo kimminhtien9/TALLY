@@ -23,7 +23,7 @@
 #define LED2_BLUE 7  // D5
 
 /* ===== FAIL-SAFE ===== */
-#define FAILSAFE_TIMEOUT 5000 // ms không tín hiệu → chớp đèn
+#define FAILSAFE_TIMEOUT 10000 // ms không tín hiệu → chớp đèn (Tăng lên 10s để tránh báo lỗi giả do rớt sóng wifi)
 #define BLINK_INTERVAL 1000   // ms mỗi lần chớp
 
 /* ===== TALLY PACKET ===== */
@@ -72,17 +72,17 @@ void setLED(uint8_t state) {
   }
 }
 
-/* ===== CHỚP ĐỎ XANH (Mất kết nối) ===== */
+/* ===== CHỚP ĐÈN XANH DƯƠNG (Mất kết nối) ===== */
 void blinkFailsafeLED() {
   unsigned long now = millis();
   if (now - lastBlinkTime >= BLINK_INTERVAL) {
     blinkState = !blinkState;
-    digitalWrite(LED1_RED, blinkState ? HIGH : LOW);
-    digitalWrite(LED2_RED, blinkState ? HIGH : LOW);
-    digitalWrite(LED1_GREEN, blinkState ? LOW : HIGH);
-    digitalWrite(LED2_GREEN, blinkState ? LOW : HIGH);
-    digitalWrite(LED1_BLUE, LOW);
-    digitalWrite(LED2_BLUE, LOW);
+    digitalWrite(LED1_RED, LOW);
+    digitalWrite(LED2_RED, LOW);
+    digitalWrite(LED1_GREEN, LOW);
+    digitalWrite(LED2_GREEN, LOW);
+    digitalWrite(LED1_BLUE, blinkState ? HIGH : LOW);
+    digitalWrite(LED2_BLUE, blinkState ? HIGH : LOW);
     lastBlinkTime = now;
   }
 }
@@ -145,6 +145,10 @@ void setup() {
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_ps(WIFI_PS_NONE); // Vô hiệu hóa chế độ Ngủ Đông của WiFi để không bị rớt mạng Tally!
   
+  // Tăng công suất phát sóng lên tối đa (tùy thuộc vào phần cứng hỗ trợ, C3 tối đa có thể lên 20dBm)
+  WiFi.setTxPower(WIFI_POWER_19_5dBm); 
+
+  
   // IN ĐỊA CHỈ MAC THẬT NỔI BẬT ĐỂ COPY
   Serial.println("\n***********************************");
   Serial.print("   COPY ĐỊA CHỈ MAC NÀY VÀO MASTER:\n   ");
@@ -205,7 +209,7 @@ void loop() {
     if (!connectionLost) {
       connectionLost = true;
       currentState = 0;
-      Serial.println("[FAIL-SAFE] Mất kết nối! Nháy Đỏ - Xanh lá...");
+      Serial.println("[FAIL-SAFE] Mất kết nối! Nháy Xanh dương (Blue)...");
     }
     blinkFailsafeLED();
   }
