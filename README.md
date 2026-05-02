@@ -4,6 +4,12 @@ Hệ thống đèn Tally không dây cho Osee Go Stream Duet.
 
 ---
 
+## Video Demo
+
+[![Video Demo](https://img.youtube.com/vi/6-U6D97J7uo/maxresdefault.jpg)](https://www.youtube.com/watch?v=6-U6D97J7uo)
+
+---
+
 ## Phần Cứng
 
 ### Master
