@@ -1,297 +1,335 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
+/* =====================================================
+   TALLY V2 - MASTER NETWORK
+   Ethernet (W5500) <- UDP từ Osee
+   ESP-NOW -> Slaves (Long Range, retry, theo dõi online)
+   ===================================================== */
+
+#include "Config.h"
 #include <ArduinoJson.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
-#include <SPI.h> // Gọi thư viện SPI để ép cấu hình W5500
+#include <SPI.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
-/* ===== PINS ===== */
+/* ===== PINS (W5500) ===== */
 #define ETH_CS 15
 #define ETH_RST 2
-// Các chân SPI dùng chung (Dành riêng cho ESP32 DevKit)
 #define SPI_SCK 18
 #define SPI_MISO 19
 #define SPI_MOSI 23
 #define UDP_PORT 19018
-#define MAX_SLAVES 4
 
-/* ===== TALLY PACKET ===== */
+/* ===== ESP-NOW RELIABILITY ===== */
+#define ESPNOW_MAX_RETRY 2     // Số lần gửi lại nếu MAC-layer báo fail
+#define SLAVE_ONLINE_TIMEOUT 3000 // ms: quá hạn không có ACK -> coi là offline
+
+/* ===== TALLY PROTOCOL (phải KHỚP với Slave) ===== */
+#define TALLY_MAGIC 0xA7
+#define TALLY_PROTO_VER 2
 typedef struct {
-  uint8_t camId; // ID Camera (1-4)
-  uint8_t state; // 0=OFF, 1=PVW (Green), 2=PGM (Red)
+  uint8_t magic;   // 0xA7 - lọc gói rác
+  uint8_t version; // 2
+  uint8_t camId;   // ID Camera (1..MAX_SLAVES)
+  uint8_t state;   // 0=OFF, 1=PVW (Green), 2=PGM (Red)
+  uint8_t seq;     // Sequence counter
 } TallyPacket;
 
-/* ===== NETWORK CLASS ===== */
+/* ===== Theo dõi trạng thái từng Slave (cho Dashboard) ===== */
+struct SlaveLink {
+  bool online = false;          // Có ACK gần đây không
+  unsigned long lastAck = 0;    // millis() lần ACK cuối
+  uint8_t state = 0;            // Trạng thái đang gửi (0/1/2)
+  uint32_t okCount = 0;
+  uint32_t failCount = 0;
+};
+
+/* ===== Static instance để callback C truy cập được ===== */
+class Network; // forward
+static Network *g_netInstance = nullptr;
+
 class Network {
 private:
   EthernetUDP udp;
-  uint8_t slaveMacs[MAX_SLAVES][6];
+  MasterConfig *config;
   bool ethernetConnected;
   bool udpReady;
   bool espnowReady;
-  int slaveCount;
-  byte mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED}; // MAC for Ethernet
-  IPAddress staticIP;
-  bool useStaticIP;
+  byte mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED}; // MAC cho W5500
+  uint8_t seqCounter = 0;
+
+  // Đối chiếu MAC -> index slave (dùng trong send callback)
+  int macToIndex(const uint8_t *m) {
+    for (int i = 0; i < config->numSlaves; i++) {
+      if (memcmp(config->macs[i], m, 6) == 0)
+        return i;
+    }
+    return -1;
+  }
 
 public:
-  Network();
+  SlaveLink slaves[MAX_SLAVES];
 
-  // Khởi tạo Ethernet (DHCP hoặc Static IP)
-  void init(const char *ip = nullptr);
+  Network() {
+    ethernetConnected = false;
+    udpReady = false;
+    espnowReady = false;
+    config = nullptr;
+    g_netInstance = this;
+  }
 
-  // Thêm MAC address của Slave
-  void addSlave(uint8_t index, const uint8_t *mac);
+  // ====== Callback khi ESP-NOW báo kết quả gửi (MAC-layer ACK) ======
+  static void onDataSent(const uint8_t *macAddr, esp_now_send_status_t status) {
+    if (!g_netInstance || !g_netInstance->config)
+      return;
+    int idx = g_netInstance->macToIndex(macAddr);
+    if (idx < 0)
+      return;
+    SlaveLink &s = g_netInstance->slaves[idx];
+    if (status == ESP_NOW_SEND_SUCCESS) {
+      s.online = true;
+      s.lastAck = millis();
+      s.okCount++;
+    } else {
+      s.failCount++;
+    }
+  }
 
-  // Xử lý UDP packet và gọi callback khi nhận được tally update
-  void handleUDP(void (*onTallyUpdate)(int pgm, int pvw));
+  /* ===== Khởi tạo Ethernet ===== */
+  void initEthernet(MasterConfig *c) {
+    config = c;
+    Serial.println("[Network] Initializing Ethernet (W5500)...");
 
-  // Gửi tally packet đến một camera cụ thể
-  void sendTally(uint8_t cam, uint8_t state);
+    pinMode(ETH_CS, OUTPUT);
+    digitalWrite(ETH_CS, HIGH);
 
-  // Rebuild và gửi tất cả camera states
-  void rebuildAndSend(int pgm, int pvw);
+    // Reset cứng W5500
+    pinMode(ETH_RST, OUTPUT);
+    digitalWrite(ETH_RST, HIGH);
+    delay(10);
+    digitalWrite(ETH_RST, LOW);
+    delay(10);
+    digitalWrite(ETH_RST, HIGH);
+    delay(150);
 
-  // Getters cho status
+    SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, ETH_CS);
+    Ethernet.init(ETH_CS);
+
+    if (config->useDhcp) {
+      Serial.println("[Network] Starting Ethernet with DHCP...");
+      if (Ethernet.begin(mac) == 0) {
+        Serial.println("[Network] DHCP failed! Using fallback static IP.");
+        IPAddress fb, gw, sn;
+        fb.fromString(config->ip);
+        gw.fromString(config->gw);
+        sn.fromString(config->sn);
+        Ethernet.begin(mac, fb, gw, sn);
+      }
+    } else {
+      IPAddress ip, gw, sn, dns;
+      ip.fromString(config->ip);
+      gw.fromString(config->gw);
+      sn.fromString(config->sn);
+      dns.fromString(config->dns);
+      Serial.printf("[Network] Static IP: %s\n", config->ip);
+      Ethernet.begin(mac, ip, dns, gw, sn);
+    }
+
+    // Chờ link vật lý
+    Serial.println("[Network] Waiting for PHY link...");
+    bool linked = false;
+    for (int i = 0; i < 15; i++) {
+      if (Ethernet.linkStatus() == LinkON) {
+        linked = true;
+        break;
+      }
+      delay(250);
+    }
+
+    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
+      Serial.println("[Network] W5500 chip not found!");
+    } else {
+      if (!linked) {
+        Serial.println("[Network] Ethernet cable is NOT connected!");
+      } else {
+        ethernetConnected = true;
+        Serial.printf("[Network] Ethernet connected! IP: %s\n",
+                      Ethernet.localIP().toString().c_str());
+      }
+      if (udp.begin(UDP_PORT)) {
+        udpReady = true;
+        Serial.printf("[Network] UDP listening on port %d\n", UDP_PORT);
+      }
+    }
+  }
+
+  /* ===== Khởi tạo ESP-NOW (Long Range, khóa kênh, công suất max) ===== */
+  void initEspNow() {
+    Serial.println("[Network] Initializing ESP-NOW...");
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    // Khóa kênh cố định (khớp Slave)
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(config->channel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    // Tắt tiết kiệm pin WiFi -> chống chập chờn ESP-NOW
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    // BẬT LONG RANGE: tăng độ nhạy ~ -129dBm, gấp ~2-4 lần tầm, ổn định hơn
+    // Yêu cầu Slave cũng bật LR thì mới giao tiếp được.
+    if (config->longRange) {
+      esp_err_t r = esp_wifi_set_protocol(WIFI_IF_STA,
+                                          WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
+                                              WIFI_PROTOCOL_11N |
+                                              WIFI_PROTOCOL_LR);
+      Serial.printf("[Network] Long Range mode: %s\n",
+                    r == ESP_OK ? "ON" : "FAILED");
+    }
+
+    // Công suất phát tối đa
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+
+    if (esp_now_init() == ESP_OK) {
+      espnowReady = true;
+      esp_now_register_send_cb(onDataSent);
+      Serial.println("[Network] ESP-NOW initialized");
+    } else {
+      Serial.println("[Network] ESP-NOW init failed!");
+      return;
+    }
+
+    // Thêm peers từ config
+    for (int i = 0; i < config->numSlaves; i++)
+      addPeer(i);
+  }
+
+  /* ===== Thêm 1 peer ESP-NOW ===== */
+  void addPeer(int index) {
+    if (index < 0 || index >= MAX_SLAVES)
+      return;
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, config->macs[index], 6);
+    peer.channel = config->channel;
+    peer.encrypt = false;
+    if (esp_now_add_peer(&peer) == ESP_OK) {
+      Serial.printf("[Network] Peer %d added: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                    index + 1, config->macs[index][0], config->macs[index][1],
+                    config->macs[index][2], config->macs[index][3],
+                    config->macs[index][4], config->macs[index][5]);
+    } else {
+      Serial.printf("[Network] Failed to add peer %d\n", index + 1);
+    }
+  }
+
+  /* ===== Xử lý UDP từ Osee ===== */
+  void handleUDP(void (*onTallyUpdate)(int pgm, int pvw)) {
+    int packetSize = udp.parsePacket();
+    if (packetSize == 0)
+      return;
+
+    char buffer[256];
+    int len = udp.read(buffer, sizeof(buffer) - 1);
+    if (len <= 0)
+      return;
+    buffer[len] = '\0';
+
+    Serial.printf("[Network] UDP RX: %s\n", buffer);
+
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, buffer);
+    if (error) {
+      Serial.printf("[Network] JSON parse error: %s\n", error.c_str());
+      return;
+    }
+
+    const char *id = doc["id"];
+    if (!id)
+      return;
+
+    JsonArray valueArray = doc["value"];
+    uint8_t cam = 0; // 0 = không cam nào
+    if (valueArray.size() > 0)
+      cam = valueArray[0];
+
+    static int currentPGM = 0;
+    static int currentPVW = 0;
+    bool stateChanged = false;
+
+    if (strcmp(id, "pgmTally") == 0) {
+      if (currentPGM != cam) {
+        currentPGM = cam;
+        stateChanged = true;
+        Serial.printf("[Network] PGM -> CAM %d\n", cam);
+      }
+    } else if (strcmp(id, "pvwTally") == 0) {
+      if (currentPVW != cam) {
+        currentPVW = cam;
+        stateChanged = true;
+        Serial.printf("[Network] PVW -> CAM %d\n", cam);
+      }
+    }
+
+    if (stateChanged && onTallyUpdate)
+      onTallyUpdate(currentPGM, currentPVW);
+  }
+
+  /* ===== Gửi 1 packet tới 1 camera (có retry) ===== */
+  void sendTally(uint8_t cam, uint8_t state) {
+    if (cam < 1 || cam > config->numSlaves)
+      return;
+
+    TallyPacket packet;
+    packet.magic = TALLY_MAGIC;
+    packet.version = TALLY_PROTO_VER;
+    packet.camId = cam;
+    packet.state = state;
+    packet.seq = seqCounter++;
+
+    slaves[cam - 1].state = state;
+
+    // Gửi + retry nếu lỗi ngay tại lệnh gọi (queue đầy / lỗi)
+    for (int attempt = 0; attempt <= ESPNOW_MAX_RETRY; attempt++) {
+      esp_err_t r = esp_now_send(config->macs[cam - 1], (uint8_t *)&packet,
+                                 sizeof(packet));
+      if (r == ESP_OK)
+        break;
+      delayMicroseconds(500);
+    }
+  }
+
+  /* ===== Gửi lại toàn bộ trạng thái cho tất cả Slave ===== */
+  void rebuildAndSend(int pgm, int pvw) {
+    for (int cam = 1; cam <= config->numSlaves; cam++) {
+      uint8_t state = 0;
+      if (cam == pgm)
+        state = 2;
+      else if (cam == pvw)
+        state = 1;
+      sendTally(cam, state);
+    }
+  }
+
+  /* ===== Cập nhật cờ online theo timeout ACK ===== */
+  void updateOnlineStatus() {
+    unsigned long now = millis();
+    for (int i = 0; i < config->numSlaves; i++) {
+      if (slaves[i].online && (now - slaves[i].lastAck > SLAVE_ONLINE_TIMEOUT))
+        slaves[i].online = false;
+    }
+  }
+
+  /* ===== Getters ===== */
   bool isEthernetConnected() { return ethernetConnected; }
   bool isUDPReady() { return udpReady; }
   bool isESPNowReady() { return espnowReady; }
   IPAddress getIP() { return Ethernet.localIP(); }
+  bool linkUp() { return Ethernet.linkStatus() == LinkON; }
 };
-
-/* ===== IMPLEMENTATION ===== */
-
-Network::Network() {
-  ethernetConnected = false;
-  udpReady = false;
-  espnowReady = false;
-  slaveCount = 0;
-  useStaticIP = false;
-}
-
-void Network::init(const char *ip) {
-  Serial.println("[Network] Initializing Ethernet...");
-
-  pinMode(ETH_CS, OUTPUT);
-  digitalWrite(ETH_CS, HIGH); // Vô hiệu hoá W5500 lúc đầu
-
-  // Kích hoạt giao tiếp chip nối tiếp W5500
-  pinMode(ETH_RST, OUTPUT);
-  digitalWrite(ETH_RST, HIGH);
-  delay(10);
-  digitalWrite(ETH_RST, LOW);
-  delay(10);
-  digitalWrite(ETH_RST, HIGH);
-  delay(150); // Cấp thêm thời gian cho W5500 khởi động lại hoàn toàn từ Reset
-
-  // Bắt đầu Bus chung SPI trước tiên (Nếu dùng chung)
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, ETH_CS);
-
-  // Gốc thư viện Ethernet trỏ qua chân CS 15
-  Ethernet.init(ETH_CS);
-
-  // Khởi động mạng có cấu hình IP/MAC
-  if (ip != nullptr) {
-    // Static IP mode
-    useStaticIP = true;
-    staticIP.fromString(ip);
-    IPAddress gateway(192, 168, 1, 1);
-    IPAddress subnet(255, 255, 255, 0);
-    IPAddress dns(8, 8, 8, 8);
-
-    Serial.printf("[Network] Try starting Ethernet with static IP: %s\n", ip);
-    Ethernet.begin(mac, staticIP, dns, gateway, subnet);
-  } else {
-    // DHCP mode
-    Serial.println("[Network] Starting Ethernet with DHCP...");
-    if (Ethernet.begin(mac) == 0) {
-      Serial.println("[Network] DHCP failed! Using fallback IP.");
-      IPAddress fallbackIP(192, 168, 1, 100);
-      IPAddress gateway(192, 168, 1, 1);
-      IPAddress subnet(255, 255, 255, 0);
-      Ethernet.begin(mac, fallbackIP, gateway, subnet);
-    }
-  }
-
-  // Chờ W5500 đàm phán Link Vật Lý (Đèn ngõ quang phải sáng!)
-  Serial.println("[Network] Waiting for PHY link...");
-  bool linked = false;
-  for (int i = 0; i < 15; i++) { // Chờ tối đa 3-4 giây
-    if (Ethernet.linkStatus() == LinkON) {
-      linked = true;
-      break;
-    }
-    delay(250);
-  }
-
-  // Check Ethernet hardware tồn tại
-  if (Ethernet.hardwareStatus() == EthernetNoHardware) {
-    Serial.println("[Network] W5500 chip not found!");
-  } else {
-    // Báo kết quả trạng thái kết nối
-    if (!linked) {
-      Serial.println("[Network] Ethernet cable is NOT connected!");
-    } else {
-      ethernetConnected = true;
-      Serial.println("[Network] Ethernet connected!");
-      Serial.printf("[Network] IP: %s\n", Ethernet.localIP().toString().c_str());
-      Serial.printf("[Network] Gateway: %s\n",
-                    Ethernet.gatewayIP().toString().c_str());
-      Serial.printf("[Network] Subnet: %s\n",
-                    Ethernet.subnetMask().toString().c_str());
-    }
-
-    // Bắt đầu mở port UDP chờ bản tin Tally
-    if (udp.begin(UDP_PORT)) {
-      udpReady = true;
-      Serial.printf("[Network] UDP listening on port %d\n", UDP_PORT);
-    }
-  }
-
-  // Chuyển WiFi sang mode Station và tắt để tránh nhiễu
-  Serial.println("[Network] Initializing ESP-NOW...");
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-
-  // Khóa cố định kênh WiFi số 1 và Tắt chế độ tiết kiệm pin (WIFI_PS_NONE)
-  // Việc này khắc phục 99% lỗi chập chờn, mất kết nối ESP-NOW dù ở rất gần
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_promiscuous(false);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  
-  // Tăng công suất phát sóng lên tối đa (gần 20dBm) để truyền đi xa nhất có thể
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-
-  if (esp_now_init() == ESP_OK) {
-    espnowReady = true;
-    Serial.println("[Network] ESP-NOW initialized");
-  } else {
-    Serial.println("[Network] ESP-NOW init failed!");
-  }
-}
-
-void Network::addSlave(uint8_t index, const uint8_t *mac) {
-  if (index >= MAX_SLAVES) {
-    Serial.printf("[Network] Invalid slave index: %d\n", index);
-    return;
-  }
-
-  // Lưu MAC address
-  memcpy(slaveMacs[index], mac, 6);
-
-  // Thêm peer vào ESP-NOW
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, mac, 6);
-  peer.channel = 1; // Fixed channel (no WiFi router to sync with)
-  peer.encrypt = false;
-
-  if (esp_now_add_peer(&peer) == ESP_OK) {
-    Serial.printf("[Network] Added slave %d: ", index + 1);
-    for (int i = 0; i < 6; i++) {
-      Serial.printf("%02X", mac[i]);
-      if (i < 5)
-        Serial.print(":");
-    }
-    Serial.println();
-    slaveCount++;
-  } else {
-    Serial.printf("[Network] Failed to add slave %d\n", index + 1);
-  }
-}
-
-void Network::handleUDP(void (*onTallyUpdate)(int pgm, int pvw)) {
-  int packetSize = udp.parsePacket();
-  if (packetSize == 0)
-    return;
-
-  // Đọc packet
-  char buffer[256];
-  int len = udp.read(buffer, sizeof(buffer) - 1);
-  if (len <= 0)
-    return;
-  buffer[len] = '\0';
-
-  Serial.printf("[Network] UDP RX: %s\n", buffer);
-
-  // Parse JSON
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, buffer);
-
-  if (error) {
-    Serial.printf("[Network] JSON parse error: %s\n", error.c_str());
-    return;
-  }
-
-  // Lấy tally data
-  const char *id = doc["id"];
-  if (!id)
-    return;
-
-  // Phát hiện xem có mảng dữ liệu mảy quay không (nếu mảng rỗng = tắt cam)
-  JsonArray valueArray = doc["value"];
-  uint8_t cam = 0; // 0 nghĩa là không có camera nào hoạt động
-  if (valueArray.size() > 0) {
-    cam = valueArray[0];
-  }
-
-  // Xác định PGM hay PVW
-  static int currentPGM = 0;
-  static int currentPVW = 0;
-  bool stateChanged = false;
-
-  if (strcmp(id, "pgmTally") == 0) {
-    if (currentPGM != cam) {
-      currentPGM = cam;
-      stateChanged = true;
-      Serial.printf("[Network] PGM updated: CAM %d\n", cam);
-    }
-  } else if (strcmp(id, "pvwTally") == 0) {
-    if (currentPVW != cam) {
-      currentPVW = cam;
-      stateChanged = true;
-      Serial.printf("[Network] PVW updated: CAM %d\n", cam);
-    }
-  }
-
-  // CHỈ Gọi callback Cập nhật Màn hình & Đèn LED nếu CÓ SỰ THAY ĐỔI
-  if (stateChanged && onTallyUpdate) {
-    onTallyUpdate(currentPGM, currentPVW);
-  }
-}
-
-void Network::sendTally(uint8_t cam, uint8_t state) {
-  if (cam < 1 || cam > MAX_SLAVES)
-    return;
-
-  TallyPacket packet;
-  packet.camId = cam;
-  packet.state = state;
-
-  esp_err_t result =
-      esp_now_send(slaveMacs[cam - 1], (uint8_t *)&packet, sizeof(packet));
-
-  if (result != ESP_OK) {
-    Serial.printf("[Network] Send failed to CAM %d\n", cam);
-  }
-}
-
-void Network::rebuildAndSend(int pgm, int pvw) {
-  for (int cam = 1; cam <= MAX_SLAVES; cam++) {
-    uint8_t state = 0; // OFF by default
-
-    if (cam == pgm) {
-      state = 2; // PGM (Red)
-    } else if (cam == pvw) {
-      state = 1; // PVW (Green)
-    }
-
-    sendTally(cam, state);
-  }
-}
 
 #endif // NETWORK_H
