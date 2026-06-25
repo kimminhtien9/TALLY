@@ -2,6 +2,8 @@
 
 Hệ thống đèn Tally không dây cho Osee Go Stream Duet.
 
+> 🆕 **TALLY V2** đã ra mắt: cấu hình động qua Web Portal (không cần nạp lại firmware), Dashboard LCD trên Master, ESP-NOW Long Range chống chập chờn. Xem **[V2_GUIDE.md](V2_GUIDE.md)**.
+
 ---
 
 ## Video Demo

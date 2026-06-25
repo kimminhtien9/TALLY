@@ -64,13 +64,18 @@ typedef struct {
 * [x] Kết nối Ethernet thay WiFi cho Master
 * [x] Hỗ trợ anten rời cả Master và Slave
 
-### Phase 2: User Experience
-* [ ] Web config portal (Captive Portal) trên Master
+### Phase 2: User Experience ✅ (V2)
+* [x] Web config portal (Captive Portal) trên Master **và** Slave
+* [x] Lưu cấu hình bền vững (NVS) – đổi CAM_ID/MAC/IP không cần nạp lại firmware
+* [x] Khôi phục LCD Master thành Dashboard 4 camera + trạng thái mạng
+* [x] ESP-NOW Long Range + retry + theo dõi online từng Slave
 * [ ] OTA firmware update
 
 ### Phase 3: Hardware
 * [ ] Thiết kế PCB tích hợp
 * [ ] Vỏ in 3D
+
+> Chi tiết V2: xem [V2_GUIDE.md](V2_GUIDE.md)
 
 ---
 
